@@ -8,6 +8,7 @@ class P(process):
         self.phase = 0
 
     def run():
+        leader = "guard"
         while True:
             send(('Token', self.id, 'out', 1 << phase), to={left, right})
 

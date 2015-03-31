@@ -6,6 +6,7 @@ class P(process):
 
     def run():
         distance = 1
+        d = -1
         while True:
             send(('Out', self.id, distance), to={left, right})
             if await(some(received(('Out', self.id, d)))):

@@ -38,7 +38,8 @@ DEL_STUB_FORMAT = "Delete_%s"
 RESET_STUB_FORMAT = "Reset_%s_Events"
 INIT_STUB_PREFIX = "Init_"
 UPDATE_STUB_PREFIX = "Update_"
-
+LOCAL_WITNESS_SET = "__witness_set__"
+LOCAL_RESULT_VAR = "__result__"
 SELF_ID_NAME = "SELF_ID"
 JB_STYLE_MODULE = "invinc.runtime"
 JB_STYLE_SET = JB_STYLE_MODULE + ".Set"
@@ -193,7 +194,7 @@ import da
 ReceivedEvent = da.pat.ReceivedEvent
 SentEvent = da.pat.SentEvent
 {self_name} = None
-Witness = None
+Witness = dict()
 JbStyle = {is_jbstyle}
 """
 
@@ -237,25 +238,26 @@ def process_query(query, state):
     events = list(extract_query_events(query))
     state.parameters.update(params)
     state.events.update(events)
-    incqu = IncInterfaceGenerator(params).visit(query)
-    qrydef = FunctionDef(
-        name=qname,
-        args=arguments(args=([arg(mangle_name(nobj), None) for nobj in params] +
-                             [arg(evt.name, None) for evt in events]),
-                       vararg=None,
-                       varargannotation=None,
-                       kwonlyargs=[],
-                       kwarg=None,
-                       kwargannotation=None,
-                       defaults=[],
-                       kw_defaults=[]),
+    iig = IncInterfaceGenerator(params)
+    incqu = iig.visit(query)
+    if iig.witness_set is None:
+        return _process_nonwitness_query(qname, params, events, query, incqu)
+    else:
+        return _process_witness_query(qname, params, events,
+                                      query, incqu, iig.witness_set)
+
+def _process_nonwitness_query(stub_name, params, events, query, inc_query):
+    qrydef = pyFunctionDef(
+        name=stub_name,
+        args=([mangle_name(nobj) for nobj in params] +
+              [evt.name for evt in events]),
         decorator_list=[],
         returns=None,
         body=[Expr(Str(to_source(query.ast))),
-              Return(incqu)])
+              Return(inc_query)])
     # Replace the query node in the main module with the hook:
     qryhook = pyCall(
-        func=pyAttr(INC_MODULE_VAR, qname),
+        func=pyAttr(INC_MODULE_VAR, stub_name),
         args=[],
         keywords=([(mangle_name(arg), PythonGenerator().visit(arg))
                    for arg in params] +
@@ -263,13 +265,60 @@ def process_query(query, state):
     query.ast_override = qryhook
     # Replace the query node in the inc module with the hook:
     inchook = pyCall(
-        func=qname,
+        func=stub_name,
         args=[],
         keywords=([(mangle_name(arg), pyName(mangle_name(arg)))
                    for arg in params] +
                   [(evt.name, pyName(evt.name)) for evt in events]))
     query.inc_query_override = inchook
     return qrydef
+
+def _process_witness_query(stub_name, params, events,
+                           query, inc_query, witness_set):
+    arglist = ([mangle_name(nobj) for nobj in params] +
+               [evt.name for evt in events])
+    qrydef = pyFunctionDef(
+        name=stub_name,
+        args=arglist,
+        body=[Expr(Str(to_source(query.ast))),
+              Global([pyName("Witness")]),
+              Assign([pyName("Witness")], # The global Witness variable
+                     pyCall("next", [pyCall("iter", [witness_set])])),
+              Return(inc_query)])
+
+    # Replace the query node in the main module with the hook:
+    qryfunc = pyFunctionDef(
+        name=query.name,
+        args=arglist,
+        body=[
+            Assign([pyName(LOCAL_RESULT_VAR)],
+                   pyCall(
+                       func=pyAttr(INC_MODULE_VAR, stub_name),
+                       args=[],
+                       keywords=([(mangle_name(arg),
+                                   PythonGenerator().visit(arg))
+                                  for arg in params] +
+                                 [(evt.name, pyAttr("self", evt.name))
+                                  for evt in events]))),
+            Return(pyName(LOCAL_RESULT_VAR))])
+    qryhook = pyCall(
+        func=query.name,
+        keywords=[()])
+    if not hasattr(query, 'prebody'):
+        query.prebody = []
+    query.prebody.append(qryfunc)
+    query.ast_override = qryhook
+
+    # Replace the query node in the inc module with the hook:
+    inchook = pyCall(
+        func=stub_name,
+        args=[],
+        keywords=([(mangle_name(arg), pyName(mangle_name(arg)))
+                   for arg in params] +
+                  [(evt.name, pyName(evt.name)) for evt in events]))
+    query.inc_query_override = inchook
+    return qrydef
+
 
 def process_all_queries(queries, state):
     """Generates query stubs for given queries."""
@@ -740,25 +789,17 @@ class QueryExtractor(NodeVisitor):
         self.queries = []
         self.processes = []
 
-    def visit_QuantifiedExpr(self, node):
-        if node.first_parent_of_type(dast.Process) is None:
-            return
-        # We try to find the largest node that contains the query:
-        par = node.last_parent_of_type(dast.BooleanExpr)
-        if par is None:
-            par = node
-        if par not in self.queries:
-            self.queries.append(par)
-
     def visit_ComplexExpr(self, node):
         if node.first_parent_of_type(dast.Process) is None:
             return
+        # We try to find the largest node that contains the query:
         par = node.last_parent_of_type(dast.QueryExpr)
         if par is None:
             par = node
         if par not in self.queries:
             self.queries.append(par)
 
+    visit_QuantifiedExpr = visit_ComplexExpr
     visit_GeneratorExpr = visit_ComplexExpr
     visit_SetCompExpr = visit_ComplexExpr
     visit_ListCompExpr = visit_ComplexExpr
@@ -780,6 +821,8 @@ class IncInterfaceGenerator(PatternComprehensionGenerator):
         # This is needed so free vars with the same name in the pattern can be
         # properly unified:
         self.freevars = set() if last_freevars is None else last_freevars
+        # The primary set for extracting witness for quantifications:
+        self.witness_set = None
 
     def reset_pattern_state(self):
         """Resets pattern related parser states.
@@ -974,19 +1017,27 @@ class IncInterfaceGenerator(PatternComprehensionGenerator):
         This transformation converts quantificactions into aggregates.
 
         """
+        primary = None
         cond = self.visit(node.predicate)
         for dom in reversed(node.domains):
             elt = optimize_tuple(pyTuple([self.visit(name)
                                           for name in dom.freevars]))
             domast = self.visit(dom)
-            gexp = SetComp(elt, [domast])
+            primary = SetComp(elt, [domast])
+            left = pySize(primary)
             if node.operator is dast.UniversalOp:
                 domast.ifs.append(pyNot(cond))
-                cond = pyCompare(pySize(gexp), Eq, Num(0))
+                cond = pyCompare(left, Eq, Num(0))
             else:
                 # Existential
                 domast.ifs.append(cond)
-                cond = pyCompare(pySize(gexp), Gt, Num(0))
+                cond = pyCompare(left, Gt, Num(0))
+
+        # Extract witness set. Note: for table1, only freevars bound in the
+        # first domain can be witnessed:
+        if node is node.top_level_query and primary is not None:
+            self.witness_set = primary
+
         return cond
 
 
@@ -999,6 +1050,7 @@ class IncInterfaceGenerator(PatternComprehensionGenerator):
 
         """
         res = None
+        query_node = node
         outer_quantifier = node.operator
         inner_quantifier = None
         outer_generators = []
@@ -1022,15 +1074,22 @@ class IncInterfaceGenerator(PatternComprehensionGenerator):
         elements = optimize_tuple(pyTuple(elements))
         generators = outer_generators + inner_generators
         bexp = self.visit(node)
+
+        # Extract witness set:
+        primary = SetComp(elements, generators)
+        left = pySize(primary)
+        if query_node is query_node.top_level_query:
+            self.witness_set = primary
+
         if inner_quantifier is None:
             # Non-alternating:
             if outer_quantifier is dast.UniversalOp:
                 bexp = pyNot(bexp)
                 generators[-1].ifs.append(bexp)
-                res = pyCompare(pySize(SetComp(elements, generators)), Eq, Num(0))
+                res = pyCompare(left, Eq, Num(0))
             else:
                 generators[-1].ifs.append(bexp)
-                res = pyCompare(pySize(SetComp(elements, generators)), Gt, Num(0))
+                res = pyCompare(left, Gt, Num(0))
 
         else:
             # One-level alternation:
@@ -1042,11 +1101,9 @@ class IncInterfaceGenerator(PatternComprehensionGenerator):
                 right = pySize(SetComp(elements, outer_generators))
             if outer_quantifier is dast.UniversalOp:
                 generators[-1].ifs.append(bexp)
-                left = pySize(SetComp(elements, generators))
                 res = pyCompare(left, Eq, right)
             else:
                 generators[-1].ifs.append(pyNot(bexp))
-                left = pySize(SetComp(elements, generators))
                 res = pyCompare(left, NotEq, right)
 
         return res

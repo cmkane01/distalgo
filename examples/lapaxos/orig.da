@@ -56,6 +56,7 @@ class Learner(process):
     def setup(acceptors:set): pass
 
     def learn():
+        n, v = (-1, -1), -1
         if await(some(received(('accepted', n, v)),
                       has= len(setof(a, received(('accepted', _n, _v), from_=a)))
                            > len(acceptors)/2)):
